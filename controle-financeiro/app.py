@@ -289,36 +289,88 @@ def build_metrics(df: pd.DataFrame) -> dict:
             "saidas": 0.0,
             "saldo": 0.0,
             "qtd": 0,
+            "ticket_medio_despesa": 0.0,
         }
 
     entradas = df.loc[df["tipo"] == "entrada", "valor"].sum()
     saidas = df.loc[df["tipo"] == "saida", "valor"].sum()
     saldo = entradas - saidas
+    despesas = df.loc[df["tipo"] == "saida", "valor"]
+    ticket_medio_despesa = float(despesas.mean()) if not despesas.empty else 0.0
 
     return {
         "entradas": float(entradas),
         "saidas": float(saidas),
         "saldo": float(saldo),
         "qtd": int(len(df)),
+        "ticket_medio_despesa": ticket_medio_despesa,
     }
+
+
+def apply_period_filter(df: pd.DataFrame, start_date, end_date) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    filtered = df.copy()
+    filtered["data_dia"] = filtered["data"].dt.date
+    filtered = filtered[
+        (filtered["data_dia"] >= start_date) &
+        (filtered["data_dia"] <= end_date)
+    ].copy()
+    filtered.drop(columns=["data_dia"], inplace=True, errors="ignore")
+    return filtered
+
+
+def build_previous_period(df: pd.DataFrame, start_date, end_date) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    period_days = (end_date - start_date).days + 1
+    previous_end = start_date - pd.Timedelta(days=1)
+    previous_start = previous_end - pd.Timedelta(days=period_days - 1)
+
+    filtered = df.copy()
+    filtered["data_dia"] = filtered["data"].dt.date
+    prev = filtered[
+        (filtered["data_dia"] >= previous_start.date()) &
+        (filtered["data_dia"] <= previous_end.date())
+    ].copy()
+    prev.drop(columns=["data_dia"], inplace=True, errors="ignore")
+    return prev
 
 
 # =========================
 # INTERFACE
 # =========================
-def page_dashboard(df: pd.DataFrame) -> None:
+def page_dashboard(df: pd.DataFrame, start_date, end_date) -> None:
     st.subheader("Visão geral")
-    metrics = build_metrics(df)
+    df_periodo = apply_period_filter(df, start_date, end_date)
+    metrics = build_metrics(df_periodo)
+    df_periodo_anterior = build_previous_period(df, start_date, end_date)
+    metrics_prev = build_metrics(df_periodo_anterior)
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Entradas", format_brl(metrics["entradas"]))
     c2.metric("Saídas", format_brl(metrics["saidas"]))
     c3.metric("Saldo", format_brl(metrics["saldo"]))
     c4.metric("Transações", metrics["qtd"])
+    c5.metric("Ticket médio despesa", format_brl(metrics["ticket_medio_despesa"]))
 
-    if df.empty:
-        st.info("Ainda não há transações salvas.")
+    if df_periodo.empty:
+        st.info("Não há transações no período selecionado.")
         return
+
+    st.caption(
+        f"Período analisado: {start_date.strftime('%d/%m/%Y')} até {end_date.strftime('%d/%m/%Y')}"
+    )
+
+    comp1, comp2, comp3 = st.columns(3)
+    delta_entradas = metrics["entradas"] - metrics_prev["entradas"]
+    delta_saidas = metrics["saidas"] - metrics_prev["saidas"]
+    delta_saldo = metrics["saldo"] - metrics_prev["saldo"]
+    comp1.metric("Variação entradas vs período anterior", format_brl(metrics["entradas"]), delta=format_brl(delta_entradas))
+    comp2.metric("Variação saídas vs período anterior", format_brl(metrics["saidas"]), delta=format_brl(delta_saidas))
+    comp3.metric("Variação saldo vs período anterior", format_brl(metrics["saldo"]), delta=format_brl(delta_saldo))
 
     df_plot = df.copy()
     df_plot["mes"] = df_plot["data"].dt.to_period("M").astype(str)
@@ -330,16 +382,39 @@ def page_dashboard(df: pd.DataFrame) -> None:
         .reset_index()
     )
 
-    st.write("**Resumo mensal**")
+    st.write("**Resumo mensal do histórico**")
     st.bar_chart(resumo_mes.set_index("mes"))
 
-    cat = df[df["tipo"] == "saida"].copy()
+    cat = df_periodo[df_periodo["tipo"] == "saida"].copy()
     if not cat.empty:
         categoria_resumo = cat.groupby("categoria", dropna=False, as_index=False)["valor"].sum()
         categoria_resumo["categoria"] = categoria_resumo["categoria"].fillna("Sem categoria")
         categoria_resumo = categoria_resumo.sort_values("valor", ascending=False)
-        st.write("**Despesas por categoria**")
+        total_despesas = categoria_resumo["valor"].sum()
+        categoria_resumo["percentual"] = categoria_resumo["valor"].apply(
+            lambda x: f"{(x / total_despesas * 100):.1f}%" if total_despesas > 0 else "0,0%"
+        )
+        categoria_resumo["valor"] = categoria_resumo["valor"].map(format_brl)
+        st.write("**Despesas por categoria no período**")
         st.dataframe(categoria_resumo, use_container_width=True, hide_index=True)
+
+        top_descricoes = (
+            cat.groupby("descricao", as_index=False)["valor"].sum()
+            .sort_values("valor", ascending=False)
+            .head(10)
+        )
+        top_descricoes["valor"] = top_descricoes["valor"].map(format_brl)
+        st.write("**Top despesas do período por descrição**")
+        st.dataframe(top_descricoes, use_container_width=True, hide_index=True)
+
+    qualidade1, qualidade2, qualidade3 = st.columns(3)
+    pendentes = int((df_periodo["status"] == "pendente").sum())
+    revisadas = int((df_periodo["status"] == "revisado").sum())
+    total = len(df_periodo)
+    percentual_revisado = (revisadas / total * 100) if total > 0 else 0
+    qualidade1.metric("Pendentes no período", pendentes)
+    qualidade2.metric("Revisadas no período", revisadas)
+    qualidade3.metric("% revisado", f"{percentual_revisado:.1f}%")
 
 
 def page_import_ofx() -> None:
@@ -523,15 +598,22 @@ def page_review() -> None:
             )
 
 
-def page_transactions(df: pd.DataFrame) -> None:
+def page_transactions(df: pd.DataFrame, start_date, end_date) -> None:
     st.subheader("Transações")
     if df.empty:
         st.info("Nenhuma transação cadastrada ainda.")
         return
 
+    df = apply_period_filter(df, start_date, end_date)
+    if df.empty:
+        st.info("Nenhuma transação encontrada no período selecionado.")
+        return
+
     filtro_tipo = st.selectbox("Filtrar por tipo", options=["todos", "entrada", "saida"])
     filtro_origem = st.selectbox("Filtrar por origem", options=["todas", "ofx", "manual"])
     filtro_status = st.selectbox("Filtrar por status", options=["todos", "pendente", "revisado"])
+    categorias = ["todas"] + sorted([c for c in df["categoria"].dropna().unique().tolist()])
+    filtro_categoria = st.selectbox("Filtrar por categoria", options=categorias)
 
     filtered = df.copy()
     if filtro_tipo != "todos":
@@ -540,6 +622,8 @@ def page_transactions(df: pd.DataFrame) -> None:
         filtered = filtered[filtered["origem"] == filtro_origem]
     if filtro_status != "todos":
         filtered = filtered[filtered["status"] == filtro_status]
+    if filtro_categoria != "todas":
+        filtered = filtered[filtered["categoria"] == filtro_categoria]
 
     filtered = filtered.copy()
     filtered["data"] = filtered["data"].dt.strftime("%d/%m/%Y")
@@ -581,8 +665,24 @@ def main() -> None:
 
     df = load_transactions()
 
+    st.sidebar.markdown("---")
+    st.sidebar.write("**Filtro de período**")
+
+    if df.empty:
+        start_date = datetime.today().date()
+        end_date = datetime.today().date()
+    else:
+        min_date = df["data"].min().date()
+        max_date = df["data"].max().date()
+        start_date = st.sidebar.date_input("Data inicial", value=min_date, min_value=min_date, max_value=max_date)
+        end_date = st.sidebar.date_input("Data final", value=max_date, min_value=min_date, max_value=max_date)
+
+        if start_date > end_date:
+            st.sidebar.error("A data inicial não pode ser maior que a data final.")
+            return
+
     if menu == "Dashboard":
-        page_dashboard(df)
+        page_dashboard(df, start_date, end_date)
     elif menu == "Importar OFX":
         page_import_ofx()
     elif menu == "Lançamento manual":
@@ -590,7 +690,7 @@ def main() -> None:
     elif menu == "Revisão":
         page_review()
     elif menu == "Transações":
-        page_transactions(df)
+        page_transactions(df, start_date, end_date)
     elif menu == "Histórico de importações":
         page_import_history()
 
