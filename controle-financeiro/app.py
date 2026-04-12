@@ -325,15 +325,18 @@ def build_previous_period(df: pd.DataFrame, start_date, end_date) -> pd.DataFram
     if df.empty:
         return df
 
+    start_date = pd.to_datetime(start_date)
+    end_date = pd.to_datetime(end_date)
+
     period_days = (end_date - start_date).days + 1
     previous_end = start_date - pd.Timedelta(days=1)
     previous_start = previous_end - pd.Timedelta(days=period_days - 1)
 
     filtered = df.copy()
-    filtered["data_dia"] = filtered["data"].dt.date
+    filtered["data_dia"] = pd.to_datetime(filtered["data"]).dt.normalize()
     prev = filtered[
-        (filtered["data_dia"] >= previous_start.date()) &
-        (filtered["data_dia"] <= previous_end.date())
+        (filtered["data_dia"] >= previous_start.normalize()) &
+        (filtered["data_dia"] <= previous_end.normalize())
     ].copy()
     prev.drop(columns=["data_dia"], inplace=True, errors="ignore")
     return prev
