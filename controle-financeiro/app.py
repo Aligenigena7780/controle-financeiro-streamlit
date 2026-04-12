@@ -419,6 +419,110 @@ def page_manual_entry() -> None:
             st.success("Lançamento manual salvo com sucesso.")
 
 
+def update_transaction(transaction_id: int, categoria: str | None, subcategoria: str | None, status: str) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE transacoes
+            SET categoria = ?, subcategoria = ?, status = ?
+            WHERE id = ?
+            """,
+            (categoria, subcategoria, status, transaction_id),
+        )
+
+
+def delete_transaction(transaction_id: int) -> None:
+    with get_connection() as conn:
+        conn.execute("DELETE FROM transacoes WHERE id = ?", (transaction_id,))
+
+
+def page_review() -> None:
+    st.subheader("Revisão de transações")
+    df = load_transactions()
+
+    if df.empty:
+        st.info("Nenhuma transação cadastrada ainda.")
+        return
+
+    col1, col2 = st.columns(2)
+    status_filter = col1.selectbox("Status", ["todos", "pendente", "revisado"], key="review_status")
+    origem_filter = col2.selectbox("Origem", ["todas", "ofx", "manual"], key="review_origin")
+
+    filtered = df.copy()
+    if status_filter != "todos":
+        filtered = filtered[filtered["status"] == status_filter]
+    if origem_filter != "todas":
+        filtered = filtered[filtered["origem"] == origem_filter]
+
+    if filtered.empty:
+        st.info("Nenhuma transação encontrada com os filtros selecionados.")
+        return
+
+    categorias_opcoes = [
+        "",
+        "Alimentação",
+        "Transporte",
+        "Moradia",
+        "Assinaturas",
+        "Lazer",
+        "Saúde",
+        "Educação",
+        "Compras",
+        "Outros",
+    ]
+
+    for _, row in filtered.iterrows():
+        with st.container(border=True):
+            c1, c2, c3, c4 = st.columns([1.2, 3.5, 1.2, 1.2])
+            c1.write(f"**Data:** {row['data'].strftime('%d/%m/%Y')}")
+            c2.write(f"**Descrição:** {row['descricao']}")
+            c3.write(f"**Tipo:** {row['tipo']}")
+            c4.write(f"**Valor:** {format_brl(float(row['valor']))}")
+
+            c5, c6, c7 = st.columns([2, 2, 2])
+            categoria_atual = row["categoria"] if pd.notna(row["categoria"]) else ""
+            subcategoria_atual = row["subcategoria"] if pd.notna(row["subcategoria"]) else ""
+            status_atual = row["status"] if pd.notna(row["status"]) else "pendente"
+
+            categoria = c5.selectbox(
+                f"Categoria #{row['id']}",
+                options=categorias_opcoes,
+                index=categorias_opcoes.index(categoria_atual) if categoria_atual in categorias_opcoes else 0,
+                key=f"cat_{row['id']}",
+            )
+            subcategoria = c6.text_input(
+                f"Subcategoria #{row['id']}",
+                value=subcategoria_atual,
+                key=f"subcat_{row['id']}",
+            )
+            status = c7.selectbox(
+                f"Status #{row['id']}",
+                options=["pendente", "revisado"],
+                index=0 if status_atual == "pendente" else 1,
+                key=f"status_{row['id']}",
+            )
+
+            c8, c9, c10 = st.columns([1.4, 1.4, 4])
+            if c8.button("Salvar", key=f"save_{row['id']}"):
+                update_transaction(
+                    transaction_id=int(row["id"]),
+                    categoria=categoria or None,
+                    subcategoria=subcategoria.strip() or None,
+                    status=status,
+                )
+                st.success(f"Transação {row['id']} atualizada.")
+                st.rerun()
+
+            if c9.button("Excluir", key=f"delete_{row['id']}"):
+                delete_transaction(int(row["id"]))
+                st.warning(f"Transação {row['id']} excluída.")
+                st.rerun()
+
+            c10.caption(
+                f"Origem: {row['origem']} | Status atual: {row['status']} | Arquivo: {row['arquivo_origem'] or '-'}"
+            )
+
+
 def page_transactions(df: pd.DataFrame) -> None:
     st.subheader("Transações")
     if df.empty:
@@ -427,12 +531,15 @@ def page_transactions(df: pd.DataFrame) -> None:
 
     filtro_tipo = st.selectbox("Filtrar por tipo", options=["todos", "entrada", "saida"])
     filtro_origem = st.selectbox("Filtrar por origem", options=["todas", "ofx", "manual"])
+    filtro_status = st.selectbox("Filtrar por status", options=["todos", "pendente", "revisado"])
 
     filtered = df.copy()
     if filtro_tipo != "todos":
         filtered = filtered[filtered["tipo"] == filtro_tipo]
     if filtro_origem != "todas":
         filtered = filtered[filtered["origem"] == filtro_origem]
+    if filtro_status != "todos":
+        filtered = filtered[filtered["status"] == filtro_status]
 
     filtered = filtered.copy()
     filtered["data"] = filtered["data"].dt.strftime("%d/%m/%Y")
@@ -466,6 +573,7 @@ def main() -> None:
             "Dashboard",
             "Importar OFX",
             "Lançamento manual",
+            "Revisão",
             "Transações",
             "Histórico de importações",
         ],
@@ -479,6 +587,8 @@ def main() -> None:
         page_import_ofx()
     elif menu == "Lançamento manual":
         page_manual_entry()
+    elif menu == "Revisão":
+        page_review()
     elif menu == "Transações":
         page_transactions(df)
     elif menu == "Histórico de importações":
