@@ -917,6 +917,103 @@ def page_patterns(df: pd.DataFrame, start_date, end_date) -> None:
     )
 
 
+def build_projection(df: pd.DataFrame) -> dict:
+    if df.empty:
+        return {}
+
+    today = pd.Timestamp.today().normalize()
+    start_month = today.replace(day=1)
+    end_month = (start_month + pd.offsets.MonthEnd(0)).normalize()
+
+    df_month = df[(df["data"] >= start_month) & (df["data"] <= today)].copy()
+
+    dias_decorridos = (today - start_month).days + 1
+    dias_mes = (end_month - start_month).days + 1
+
+    if dias_decorridos < 5 or df_month.empty:
+        return {"valido": False}
+
+    total_gasto = df_month[df_month["tipo"] == "saida"]["valor"].sum()
+
+    gasto_medio = total_gasto / dias_decorridos if dias_decorridos > 0 else 0
+    projecao_total = gasto_medio * dias_mes
+
+    return {
+        "valido": True,
+        "gasto_atual": float(total_gasto),
+        "projecao": float(projecao_total),
+        "dias_decorridos": dias_decorridos,
+        "dias_mes": dias_mes
+    }
+
+
+def build_projection_by_category(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+
+    today = pd.Timestamp.today().normalize()
+    start_month = today.replace(day=1)
+    end_month = (start_month + pd.offsets.MonthEnd(0)).normalize()
+
+    df_month = df[(df["data"] >= start_month) & (df["data"] <= today)].copy()
+
+    dias_decorridos = (today - start_month).days + 1
+    dias_mes = (end_month - start_month).days + 1
+
+    if dias_decorridos < 5 or df_month.empty:
+        return pd.DataFrame()
+
+    despesas = df_month[df_month["tipo"] == "saida"].copy()
+
+    grouped = (
+        despesas.groupby("categoria", dropna=False)["valor"]
+        .sum()
+        .reset_index()
+    )
+
+    grouped["categoria"] = grouped["categoria"].fillna("Sem categoria")
+    grouped["gasto_atual"] = grouped["valor"]
+    grouped["gasto_medio"] = grouped["gasto_atual"] / dias_decorridos
+    grouped["projecao"] = grouped["gasto_medio"] * dias_mes
+
+    return grouped
+
+
+def page_projection(df: pd.DataFrame) -> None:
+    st.subheader("Projeção do mês atual")
+
+    proj = build_projection(df)
+
+    if not proj or not proj.get("valido"):
+        st.info("Dados insuficientes para projeção (mínimo 5 dias de dados no mês).")
+        return
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Gasto atual", format_brl(proj["gasto_atual"]))
+    c2.metric("Projeção do mês", format_brl(proj["projecao"]))
+    c3.metric("Dias considerados", f"{proj['dias_decorridos']} / {proj['dias_mes']}")
+
+    diff = proj["projecao"] - proj["gasto_atual"]
+    if diff > 0:
+        st.warning(f"Mantendo o ritmo atual, você deve gastar mais {format_brl(diff)} até o fim do mês.")
+    else:
+        st.success("Ritmo de gasto controlado.")
+
+    st.markdown("---")
+
+    st.write("**Projeção por categoria**")
+    cat_df = build_projection_by_category(df)
+
+    if cat_df.empty:
+        st.info("Sem dados suficientes por categoria.")
+        return
+
+    cat_df["gasto_atual"] = cat_df["gasto_atual"].map(format_brl)
+    cat_df["projecao"] = cat_df["projecao"].map(format_brl)
+
+    st.dataframe(cat_df[["categoria", "gasto_atual", "projecao"]], use_container_width=True, hide_index=True)
+
+
 def main() -> None:
     st.set_page_config(page_title="Controle Financeiro Pessoal", layout="wide")
     init_db()
@@ -934,6 +1031,7 @@ def main() -> None:
             "Transações",
             "Orçamento",
             "Padrões",
+            "Projeção",
             "Histórico de importações",
         ],
     )
@@ -970,6 +1068,8 @@ def main() -> None:
         page_budget(df, start_date, end_date)
     elif menu == "Padrões":
         page_patterns(df, start_date, end_date)
+    elif menu == "Projeção":
+        page_projection(df)
     elif menu == "Histórico de importações":
         page_import_history()
 
