@@ -917,66 +917,130 @@ def page_patterns(df: pd.DataFrame, start_date, end_date) -> None:
     )
 
 
-def build_projection(df: pd.DataFrame) -> dict:
-    if df.empty:
-        return {}
+def build_insights(df: pd.DataFrame, start_date, end_date) -> list[tuple[str, str]]:
+    insights = []
+    df_periodo = apply_period_filter(df, start_date, end_date)
+    if df_periodo.empty:
+        return insights
 
-    today = pd.Timestamp.today().normalize()
-    start_month = today.replace(day=1)
-    end_month = (start_month + pd.offsets.MonthEnd(0)).normalize()
+    despesas_periodo = df_periodo[df_periodo["tipo"] == "saida"].copy()
+    total_despesas = float(despesas_periodo["valor"].sum()) if not despesas_periodo.empty else 0.0
 
-    df_month = df[(df["data"] >= start_month) & (df["data"] <= today)].copy()
+    if total_despesas > 0 and not despesas_periodo.empty:
+        cat = (
+            despesas_periodo.groupby("categoria", dropna=False, as_index=False)["valor"]
+            .sum()
+            .sort_values("valor", ascending=False)
+        )
+        cat["categoria"] = cat["categoria"].fillna("Sem categoria")
 
-    dias_decorridos = (today - start_month).days + 1
-    dias_mes = (end_month - start_month).days + 1
+        if not cat.empty:
+            top1 = cat.iloc[0]
+            perc_top1 = top1["valor"] / total_despesas * 100
+            if perc_top1 >= 30:
+                insights.append((
+                    "warning",
+                    f"{top1['categoria']} representa {perc_top1:.1f}% das suas despesas do período ({format_brl(float(top1['valor']))})."
+                ))
 
-    if dias_decorridos < 5 or df_month.empty:
-        return {"valido": False}
+            top3 = cat.head(3)["valor"].sum()
+            perc_top3 = top3 / total_despesas * 100
+            if perc_top3 >= 70:
+                insights.append((
+                    "info",
+                    f"As 3 maiores categorias concentram {perc_top3:.1f}% das suas despesas do período."
+                ))
 
-    total_gasto = df_month[df_month["tipo"] == "saida"]["valor"].sum()
+    df_prev = build_previous_period(df, start_date, end_date)
+    despesas_prev = df_prev[df_prev["tipo"] == "saida"].copy()
 
-    gasto_medio = total_gasto / dias_decorridos if dias_decorridos > 0 else 0
-    projecao_total = gasto_medio * dias_mes
+    if not despesas_periodo.empty and not despesas_prev.empty:
+        cat_atual = despesas_periodo.groupby("categoria", dropna=False)["valor"].sum()
+        cat_prev = despesas_prev.groupby("categoria", dropna=False)["valor"].sum()
+        variacoes = []
+        for categoria, valor_atual in cat_atual.items():
+            valor_prev = float(cat_prev.get(categoria, 0.0))
+            if valor_prev > 0:
+                variacao = ((float(valor_atual) - valor_prev) / valor_prev) * 100
+                variacoes.append((categoria if pd.notna(categoria) else "Sem categoria", variacao, float(valor_atual), valor_prev))
+        variacoes = sorted(variacoes, key=lambda x: x[1], reverse=True)
+        if variacoes and variacoes[0][1] >= 20:
+            categoria, variacao, valor_atual, valor_prev = variacoes[0]
+            insights.append((
+                "warning",
+                f"{categoria} aumentou {variacao:.1f}% versus o período anterior ({format_brl(valor_prev)} → {format_brl(valor_atual)})."
+            ))
 
-    return {
-        "valido": True,
-        "gasto_atual": float(total_gasto),
-        "projecao": float(projecao_total),
-        "dias_decorridos": dias_decorridos,
-        "dias_mes": dias_mes
-    }
+    budgets = load_budgets()
+    if not budgets.empty and not despesas_periodo.empty:
+        realizado = (
+            despesas_periodo.groupby("categoria", dropna=False)["valor"].sum().reset_index()
+            .rename(columns={"valor": "valor_realizado"})
+        )
+        realizado["categoria"] = realizado["categoria"].fillna("Sem categoria")
+        comparativo = budgets[["categoria", "valor_orcado"]].merge(realizado, on="categoria", how="left")
+        comparativo["valor_realizado"] = comparativo["valor_realizado"].fillna(0.0)
+        comparativo["percentual"] = comparativo.apply(
+            lambda row: (row["valor_realizado"] / row["valor_orcado"] * 100) if row["valor_orcado"] > 0 else 0.0,
+            axis=1,
+        )
+        estourados = comparativo[comparativo["percentual"] > 100]
+        atencao = comparativo[(comparativo["percentual"] >= 80) & (comparativo["percentual"] <= 100)]
+        if not estourados.empty:
+            row = estourados.sort_values("percentual", ascending=False).iloc[0]
+            excesso = float(row["valor_realizado"] - row["valor_orcado"])
+            insights.append((
+                "error",
+                f"{row['categoria']} estourou o orçamento em {format_brl(excesso)} no período."
+            ))
+        elif not atencao.empty:
+            row = atencao.sort_values("percentual", ascending=False).iloc[0]
+            insights.append((
+                "warning",
+                f"{row['categoria']} já consumiu {row['percentual']:.1f}% do orçamento no período."
+            ))
+
+    recorrencia = build_recurring_analysis(df_periodo)
+    if not recorrencia.empty:
+        recorrentes = recorrencia[recorrencia["classificacao"] == "Recorrente"]
+        if not recorrentes.empty:
+            custo_recorrente = float(recorrentes["custo_mensal_estimado"].sum())
+            insights.append((
+                "info",
+                f"Seus custos recorrentes estimados no mês somam {format_brl(custo_recorrente)}."
+            ))
+
+    proj = build_projection(df)
+    if proj and proj.get("valido"):
+        budgets = load_budgets()
+        if not budgets.empty:
+            total_orcado = float(budgets["valor_orcado"].sum())
+            if total_orcado > 0 and float(proj["projecao"]) > total_orcado:
+                excesso_proj = float(proj["projecao"]) - total_orcado
+                insights.append((
+                    "error",
+                    f"Mantendo o ritmo atual, a projeção do mês supera o orçamento total em {format_brl(excesso_proj)}."
+                ))
+
+    return insights[:8]
 
 
-def build_projection_by_category(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return pd.DataFrame()
+def page_insights(df: pd.DataFrame, start_date, end_date) -> None:
+    st.subheader("Insights")
+    st.caption("Leitura automática dos principais sinais do período selecionado.")
 
-    today = pd.Timestamp.today().normalize()
-    start_month = today.replace(day=1)
-    end_month = (start_month + pd.offsets.MonthEnd(0)).normalize()
+    insights = build_insights(df, start_date, end_date)
+    if not insights:
+        st.info("Ainda não há dados suficientes para gerar insights relevantes neste período.")
+        return
 
-    df_month = df[(df["data"] >= start_month) & (df["data"] <= today)].copy()
-
-    dias_decorridos = (today - start_month).days + 1
-    dias_mes = (end_month - start_month).days + 1
-
-    if dias_decorridos < 5 or df_month.empty:
-        return pd.DataFrame()
-
-    despesas = df_month[df_month["tipo"] == "saida"].copy()
-
-    grouped = (
-        despesas.groupby("categoria", dropna=False)["valor"]
-        .sum()
-        .reset_index()
-    )
-
-    grouped["categoria"] = grouped["categoria"].fillna("Sem categoria")
-    grouped["gasto_atual"] = grouped["valor"]
-    grouped["gasto_medio"] = grouped["gasto_atual"] / dias_decorridos
-    grouped["projecao"] = grouped["gasto_medio"] * dias_mes
-
-    return grouped
+    for level, message in insights:
+        if level == "error":
+            st.error(message)
+        elif level == "warning":
+            st.warning(message)
+        else:
+            st.info(message)
 
 
 def page_projection(df: pd.DataFrame) -> None:
@@ -1038,6 +1102,7 @@ def main() -> None:
             "Orçamento",
             "Padrões",
             "Projeção",
+            "Insights",
             "Histórico de importações",
         ],
     )
@@ -1076,6 +1141,8 @@ def main() -> None:
         page_patterns(df, start_date, end_date)
     elif menu == "Projeção":
         page_projection(df)
+    elif menu == "Insights":
+        page_insights(df, start_date, end_date)
     elif menu == "Histórico de importações":
         page_import_history()
 
