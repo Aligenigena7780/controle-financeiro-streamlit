@@ -319,6 +319,52 @@ def load_budgets() -> pd.DataFrame:
         )
 
 
+def build_recurring_analysis(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+
+    base = df.copy()
+    base = base[base["tipo"] == "saida"].copy()
+    if base.empty:
+        return pd.DataFrame()
+
+    base["ano_mes"] = base["data"].dt.to_period("M").astype(str)
+
+    grouped = (
+        base.groupby(["descricao", "categoria"], dropna=False)
+        .agg(
+            ocorrencias=("id", "count"),
+            total_gasto=("valor", "sum"),
+            media_valor=("valor", "mean"),
+            meses_distintos=("ano_mes", "nunique"),
+            primeira_data=("data", "min"),
+            ultima_data=("data", "max"),
+        )
+        .reset_index()
+    )
+
+    def classify_pattern(row) -> str:
+        if row["meses_distintos"] >= 2:
+            return "Recorrente"
+        if row["ocorrencias"] >= 3:
+            return "Frequente"
+        return "Pontual"
+
+    grouped["categoria"] = grouped["categoria"].fillna("Sem categoria")
+    grouped["classificacao"] = grouped.apply(classify_pattern, axis=1)
+    grouped["custo_anual_estimado"] = grouped["media_valor"] * 12
+    grouped["custo_mensal_estimado"] = grouped.apply(
+        lambda row: row["media_valor"] if row["classificacao"] == "Recorrente" else row["total_gasto"] / max(row["meses_distintos"], 1),
+        axis=1,
+    )
+
+    grouped = grouped.sort_values(
+        by=["classificacao", "custo_mensal_estimado", "total_gasto"],
+        ascending=[True, False, False],
+    )
+    return grouped
+
+
 # =========================
 # MÉTRICAS
 # =========================
@@ -795,9 +841,82 @@ def page_budget(df: pd.DataFrame, start_date, end_date) -> None:
                 )
 
 
-# =========================
-# APP
-# =========================
+def page_patterns(df: pd.DataFrame, start_date, end_date) -> None:
+    st.subheader("Padrões e recorrência")
+
+    df_periodo = apply_period_filter(df, start_date, end_date)
+    analysis = build_recurring_analysis(df_periodo)
+
+    if analysis.empty:
+        st.info("Não há despesas suficientes no período selecionado para analisar padrões.")
+        return
+
+    recorrentes = analysis[analysis["classificacao"] == "Recorrente"].copy()
+    frequentes = analysis[analysis["classificacao"] == "Frequente"].copy()
+    pontuais = analysis[analysis["classificacao"] == "Pontual"].copy()
+
+    custo_recorrente_mensal = float(recorrentes["custo_mensal_estimado"].sum()) if not recorrentes.empty else 0.0
+    custo_recorrente_anual = float(recorrentes["custo_anual_estimado"].sum()) if not recorrentes.empty else 0.0
+    qtd_recorrentes = int(len(recorrentes))
+    qtd_frequentes = int(len(frequentes))
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Itens recorrentes", qtd_recorrentes)
+    c2.metric("Itens frequentes", qtd_frequentes)
+    c3.metric("Custo recorrente mensal estimado", format_brl(custo_recorrente_mensal))
+    c4.metric("Custo recorrente anual estimado", format_brl(custo_recorrente_anual))
+
+    st.write("**Resumo por classificação**")
+    resumo_classificacao = (
+        analysis.groupby("classificacao", as_index=False)
+        .agg(
+            itens=("descricao", "count"),
+            total_gasto=("total_gasto", "sum"),
+            custo_mensal_estimado=("custo_mensal_estimado", "sum"),
+        )
+        .sort_values("custo_mensal_estimado", ascending=False)
+    )
+    resumo_classificacao["total_gasto"] = resumo_classificacao["total_gasto"].map(format_brl)
+    resumo_classificacao["custo_mensal_estimado"] = resumo_classificacao["custo_mensal_estimado"].map(format_brl)
+    st.dataframe(resumo_classificacao, use_container_width=True, hide_index=True)
+
+    st.write("**Recorrências detectadas**")
+    if recorrentes.empty:
+        st.info("Nenhum item recorrente detectado no período selecionado.")
+    else:
+        recorrentes_exibir = recorrentes.copy()
+        recorrentes_exibir["total_gasto"] = recorrentes_exibir["total_gasto"].map(format_brl)
+        recorrentes_exibir["media_valor"] = recorrentes_exibir["media_valor"].map(format_brl)
+        recorrentes_exibir["custo_mensal_estimado"] = recorrentes_exibir["custo_mensal_estimado"].map(format_brl)
+        recorrentes_exibir["custo_anual_estimado"] = recorrentes_exibir["custo_anual_estimado"].map(format_brl)
+        recorrentes_exibir["primeira_data"] = pd.to_datetime(recorrentes_exibir["primeira_data"]).dt.strftime("%d/%m/%Y")
+        recorrentes_exibir["ultima_data"] = pd.to_datetime(recorrentes_exibir["ultima_data"]).dt.strftime("%d/%m/%Y")
+        st.dataframe(recorrentes_exibir, use_container_width=True, hide_index=True)
+
+    st.write("**Gastos frequentes**")
+    if frequentes.empty:
+        st.info("Nenhum item frequente detectado no período selecionado.")
+    else:
+        frequentes_exibir = frequentes.copy()
+        frequentes_exibir["total_gasto"] = frequentes_exibir["total_gasto"].map(format_brl)
+        frequentes_exibir["media_valor"] = frequentes_exibir["media_valor"].map(format_brl)
+        frequentes_exibir["custo_mensal_estimado"] = frequentes_exibir["custo_mensal_estimado"].map(format_brl)
+        frequentes_exibir["custo_anual_estimado"] = frequentes_exibir["custo_anual_estimado"].map(format_brl)
+        frequentes_exibir["primeira_data"] = pd.to_datetime(frequentes_exibir["primeira_data"]).dt.strftime("%d/%m/%Y")
+        frequentes_exibir["ultima_data"] = pd.to_datetime(frequentes_exibir["ultima_data"]).dt.strftime("%d/%m/%Y")
+        st.dataframe(frequentes_exibir, use_container_width=True, hide_index=True)
+
+    top_impacto = analysis.sort_values("custo_mensal_estimado", ascending=False).head(10).copy()
+    top_impacto["custo_mensal_estimado"] = top_impacto["custo_mensal_estimado"].map(format_brl)
+    top_impacto["total_gasto"] = top_impacto["total_gasto"].map(format_brl)
+    st.write("**Top 10 impactos estimados no mês**")
+    st.dataframe(
+        top_impacto[["descricao", "categoria", "classificacao", "ocorrencias", "meses_distintos", "custo_mensal_estimado", "total_gasto"]],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
 def main() -> None:
     st.set_page_config(page_title="Controle Financeiro Pessoal", layout="wide")
     init_db()
@@ -814,6 +933,7 @@ def main() -> None:
             "Revisão",
             "Transações",
             "Orçamento",
+            "Padrões",
             "Histórico de importações",
         ],
     )
@@ -848,6 +968,8 @@ def main() -> None:
         page_transactions(df, start_date, end_date)
     elif menu == "Orçamento":
         page_budget(df, start_date, end_date)
+    elif menu == "Padrões":
+        page_patterns(df, start_date, end_date)
     elif menu == "Histórico de importações":
         page_import_history()
 
