@@ -982,6 +982,12 @@ def build_projection_by_category(df: pd.DataFrame) -> pd.DataFrame:
 def page_projection(df: pd.DataFrame) -> None:
     st.subheader("Projeção do mês atual")
 
+    hoje = pd.Timestamp.today().normalize()
+    inicio_mes = hoje.replace(day=1)
+    st.caption(
+        f"Esta projeção considera apenas o mês atual, independentemente do filtro lateral. Período usado: {inicio_mes.strftime('%d/%m/%Y')} até {hoje.strftime('%d/%m/%Y')}."
+    )
+
     proj = build_projection(df)
 
     if not proj or not proj.get("valido"):
