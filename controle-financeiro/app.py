@@ -56,6 +56,18 @@ def init_db() -> None:
             """
         )
 
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS orcamentos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                categoria TEXT NOT NULL UNIQUE,
+                valor_orcado REAL NOT NULL,
+                data_criacao TEXT NOT NULL,
+                data_atualizacao TEXT NOT NULL
+            )
+            """
+        )
+
 
 # =========================
 # CATEGORIZAÇÃO INICIAL
@@ -270,6 +282,38 @@ def load_imports() -> pd.DataFrame:
             SELECT id, nome_arquivo, origem, data_importacao, total_linhas, novas_linhas, duplicadas
             FROM importacoes
             ORDER BY id DESC
+            """,
+            conn,
+        )
+
+
+def upsert_budget(categoria: str, valor_orcado: float) -> None:
+    now = datetime.now().isoformat(timespec="seconds")
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO orcamentos (categoria, valor_orcado, data_criacao, data_atualizacao)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(categoria) DO UPDATE SET
+                valor_orcado = excluded.valor_orcado,
+                data_atualizacao = excluded.data_atualizacao
+            """,
+            (categoria, valor_orcado, now, now),
+        )
+
+
+def delete_budget(categoria: str) -> None:
+    with get_connection() as conn:
+        conn.execute("DELETE FROM orcamentos WHERE categoria = ?", (categoria,))
+
+
+def load_budgets() -> pd.DataFrame:
+    with get_connection() as conn:
+        return pd.read_sql_query(
+            """
+            SELECT categoria, valor_orcado, data_criacao, data_atualizacao
+            FROM orcamentos
+            ORDER BY categoria
             """,
             conn,
         )
@@ -644,6 +688,113 @@ def page_import_history() -> None:
     st.dataframe(imports_df, use_container_width=True, hide_index=True)
 
 
+def page_budget(df: pd.DataFrame, start_date, end_date) -> None:
+    st.subheader("Orçamento")
+
+    categorias_base = [
+        "Alimentação",
+        "Transporte",
+        "Moradia",
+        "Assinaturas",
+        "Lazer",
+        "Saúde",
+        "Educação",
+        "Compras",
+        "Outros",
+    ]
+
+    with st.form("budget_form"):
+        col1, col2 = st.columns(2)
+        categoria = col1.selectbox("Categoria", categorias_base)
+        valor_orcado = col2.number_input("Valor orçado", min_value=0.01, step=0.01, format="%.2f")
+        submitted = st.form_submit_button("Salvar orçamento")
+        if submitted:
+            upsert_budget(categoria, float(valor_orcado))
+            st.success(f"Orçamento salvo para {categoria}.")
+            st.rerun()
+
+    budgets = load_budgets()
+    if budgets.empty:
+        st.info("Nenhum orçamento cadastrado ainda.")
+        return
+
+    st.write("**Orçamentos cadastrados**")
+    exibir_budgets = budgets.copy()
+    exibir_budgets["valor_orcado"] = exibir_budgets["valor_orcado"].map(format_brl)
+    st.dataframe(exibir_budgets, use_container_width=True, hide_index=True)
+
+    st.write("**Remover orçamento**")
+    col_del1, col_del2 = st.columns([2, 1])
+    categoria_delete = col_del1.selectbox("Categoria para excluir", budgets["categoria"].tolist(), key="budget_delete")
+    if col_del2.button("Excluir orçamento"):
+        delete_budget(categoria_delete)
+        st.warning(f"Orçamento excluído para {categoria_delete}.")
+        st.rerun()
+
+    df_periodo = apply_period_filter(df, start_date, end_date)
+    despesas_periodo = df_periodo[df_periodo["tipo"] == "saida"].copy()
+
+    realizado = (
+        despesas_periodo.groupby("categoria", dropna=False, as_index=False)["valor"]
+        .sum()
+        .rename(columns={"valor": "valor_realizado"})
+    )
+    realizado["categoria"] = realizado["categoria"].fillna("Sem categoria")
+
+    comparativo = budgets[["categoria", "valor_orcado"]].merge(
+        realizado,
+        on="categoria",
+        how="left",
+    )
+    comparativo["valor_realizado"] = comparativo["valor_realizado"].fillna(0.0)
+    comparativo["diferenca"] = comparativo["valor_orcado"] - comparativo["valor_realizado"]
+    comparativo["percentual_consumido"] = comparativo.apply(
+        lambda row: (row["valor_realizado"] / row["valor_orcado"] * 100) if row["valor_orcado"] > 0 else 0,
+        axis=1,
+    )
+
+    total_orcado = float(comparativo["valor_orcado"].sum())
+    total_realizado = float(comparativo["valor_realizado"].sum())
+    saldo_orcamento = total_orcado - total_realizado
+    percentual_total = (total_realizado / total_orcado * 100) if total_orcado > 0 else 0
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Orçamento total", format_brl(total_orcado))
+    c2.metric("Realizado no período", format_brl(total_realizado))
+    c3.metric("Saldo do orçamento", format_brl(saldo_orcamento))
+    c4.metric("% consumido", f"{percentual_total:.1f}%")
+
+    comparativo_exibir = comparativo.copy()
+    comparativo_exibir["status_alerta"] = comparativo_exibir["percentual_consumido"].apply(
+        lambda x: "Estourado" if x > 100 else ("Atenção" if x >= 80 else "Ok")
+    )
+    comparativo_exibir["valor_orcado"] = comparativo_exibir["valor_orcado"].map(format_brl)
+    comparativo_exibir["valor_realizado"] = comparativo_exibir["valor_realizado"].map(format_brl)
+    comparativo_exibir["diferenca"] = comparativo_exibir["diferenca"].map(format_brl)
+    comparativo_exibir["percentual_consumido"] = comparativo_exibir["percentual_consumido"].apply(lambda x: f"{x:.1f}%")
+
+    st.write("**Comparativo orçado x realizado no período**")
+    st.dataframe(comparativo_exibir, use_container_width=True, hide_index=True)
+
+    estourados = comparativo[comparativo["percentual_consumido"] > 100].copy()
+    atencao = comparativo[(comparativo["percentual_consumido"] >= 80) & (comparativo["percentual_consumido"] <= 100)].copy()
+
+    st.write("**Alertas**")
+    if estourados.empty and atencao.empty:
+        st.success("Nenhuma categoria em alerta no período selecionado.")
+    else:
+        if not estourados.empty:
+            for _, row in estourados.iterrows():
+                st.error(
+                    f"{row['categoria']}: realizado {format_brl(float(row['valor_realizado']))} para orçamento de {format_brl(float(row['valor_orcado']))} ({row['percentual_consumido']:.1f}%)."
+                )
+        if not atencao.empty:
+            for _, row in atencao.iterrows():
+                st.warning(
+                    f"{row['categoria']}: consumo em {row['percentual_consumido']:.1f}% do orçamento."
+                )
+
+
 # =========================
 # APP
 # =========================
@@ -662,6 +813,7 @@ def main() -> None:
             "Lançamento manual",
             "Revisão",
             "Transações",
+            "Orçamento",
             "Histórico de importações",
         ],
     )
@@ -694,6 +846,8 @@ def main() -> None:
         page_review()
     elif menu == "Transações":
         page_transactions(df, start_date, end_date)
+    elif menu == "Orçamento":
+        page_budget(df, start_date, end_date)
     elif menu == "Histórico de importações":
         page_import_history()
 
