@@ -919,233 +919,156 @@ def page_patterns(df: pd.DataFrame, start_date, end_date) -> None:
 
 def build_insights(df: pd.DataFrame, start_date, end_date) -> list[tuple[str, str]]:
     insights = []
+
     df_periodo = apply_period_filter(df, start_date, end_date)
+
     if df_periodo.empty:
         return insights
 
     despesas_periodo = df_periodo[df_periodo["tipo"] == "saida"].copy()
     total_despesas = float(despesas_periodo["valor"].sum()) if not despesas_periodo.empty else 0.0
 
+    # ---------------------------
+    # 🔹 Concentração de gastos
+    # ---------------------------
     if total_despesas > 0 and not despesas_periodo.empty:
         cat = (
-            despesas_periodo.groupby("categoria", dropna=False, as_index=False)["valor"]
+            despesas_periodo.groupby("categoria", dropna=False)["valor"]
             .sum()
+            .reset_index()
             .sort_values("valor", ascending=False)
         )
+
         cat["categoria"] = cat["categoria"].fillna("Sem categoria")
 
         if not cat.empty:
             top1 = cat.iloc[0]
             perc_top1 = top1["valor"] / total_despesas * 100
+
             if perc_top1 >= 30:
                 insights.append((
                     "warning",
-                    f"{top1['categoria']} representa {perc_top1:.1f}% das suas despesas do período ({format_brl(float(top1['valor']))})."
+                    f"{top1['categoria']} representa {perc_top1:.1f}% das suas despesas ({format_brl(float(top1['valor']))})."
                 ))
 
             top3 = cat.head(3)["valor"].sum()
             perc_top3 = top3 / total_despesas * 100
+
             if perc_top3 >= 70:
                 insights.append((
                     "info",
-                    f"As 3 maiores categorias concentram {perc_top3:.1f}% das suas despesas do período."
+                    f"As 3 maiores categorias concentram {perc_top3:.1f}% das despesas."
                 ))
 
+    # ---------------------------
+    # 🔹 Variação vs período anterior
+    # ---------------------------
     df_prev = build_previous_period(df, start_date, end_date)
     despesas_prev = df_prev[df_prev["tipo"] == "saida"].copy()
 
     if not despesas_periodo.empty and not despesas_prev.empty:
-        cat_atual = despesas_periodo.groupby("categoria", dropna=False)["valor"].sum()
-        cat_prev = despesas_prev.groupby("categoria", dropna=False)["valor"].sum()
+        cat_atual = despesas_periodo.groupby("categoria")["valor"].sum()
+        cat_prev = despesas_prev.groupby("categoria")["valor"].sum()
+
         variacoes = []
+
         for categoria, valor_atual in cat_atual.items():
             valor_prev = float(cat_prev.get(categoria, 0.0))
+
             if valor_prev > 0:
                 variacao = ((float(valor_atual) - valor_prev) / valor_prev) * 100
-                variacoes.append((categoria if pd.notna(categoria) else "Sem categoria", variacao, float(valor_atual), valor_prev))
+                variacoes.append((categoria, variacao, float(valor_atual), valor_prev))
+
         variacoes = sorted(variacoes, key=lambda x: x[1], reverse=True)
+
         if variacoes and variacoes[0][1] >= 20:
             categoria, variacao, valor_atual, valor_prev = variacoes[0]
+
             insights.append((
                 "warning",
-                f"{categoria} aumentou {variacao:.1f}% versus o período anterior ({format_brl(valor_prev)} → {format_brl(valor_atual)})."
+                f"{categoria} aumentou {variacao:.1f}% vs período anterior ({format_brl(valor_prev)} → {format_brl(valor_atual)})."
             ))
 
+    # ---------------------------
+    # 🔹 Orçamento
+    # ---------------------------
     budgets = load_budgets()
+
     if not budgets.empty and not despesas_periodo.empty:
         realizado = (
-            despesas_periodo.groupby("categoria", dropna=False)["valor"].sum().reset_index()
+            despesas_periodo.groupby("categoria")["valor"]
+            .sum()
+            .reset_index()
             .rename(columns={"valor": "valor_realizado"})
         )
+
         realizado["categoria"] = realizado["categoria"].fillna("Sem categoria")
-        comparativo = budgets[["categoria", "valor_orcado"]].merge(realizado, on="categoria", how="left")
+
+        comparativo = budgets[["categoria", "valor_orcado"]].merge(
+            realizado, on="categoria", how="left"
+        )
+
         comparativo["valor_realizado"] = comparativo["valor_realizado"].fillna(0.0)
+
         comparativo["percentual"] = comparativo.apply(
-            lambda row: (row["valor_realizado"] / row["valor_orcado"] * 100) if row["valor_orcado"] > 0 else 0.0,
+            lambda row: (row["valor_realizado"] / row["valor_orcado"] * 100)
+            if row["valor_orcado"] > 0 else 0.0,
             axis=1,
         )
+
         estourados = comparativo[comparativo["percentual"] > 100]
         atencao = comparativo[(comparativo["percentual"] >= 80) & (comparativo["percentual"] <= 100)]
+
         if not estourados.empty:
             row = estourados.sort_values("percentual", ascending=False).iloc[0]
             excesso = float(row["valor_realizado"] - row["valor_orcado"])
+
             insights.append((
                 "error",
-                f"{row['categoria']} estourou o orçamento em {format_brl(excesso)} no período."
+                f"{row['categoria']} estourou o orçamento em {format_brl(excesso)}."
             ))
+
         elif not atencao.empty:
             row = atencao.sort_values("percentual", ascending=False).iloc[0]
+
             insights.append((
                 "warning",
-                f"{row['categoria']} já consumiu {row['percentual']:.1f}% do orçamento no período."
+                f"{row['categoria']} já consumiu {row['percentual']:.1f}% do orçamento."
             ))
 
+    # ---------------------------
+    # 🔹 Recorrência
+    # ---------------------------
     recorrencia = build_recurring_analysis(df_periodo)
+
     if not recorrencia.empty:
         recorrentes = recorrencia[recorrencia["classificacao"] == "Recorrente"]
+
         if not recorrentes.empty:
             custo_recorrente = float(recorrentes["custo_mensal_estimado"].sum())
+
             insights.append((
                 "info",
-                f"Seus custos recorrentes estimados no mês somam {format_brl(custo_recorrente)}."
+                f"Seus custos recorrentes mensais estimados são {format_brl(custo_recorrente)}."
             ))
 
+    # ---------------------------
+    # 🔹 Projeção
+    # ---------------------------
     proj = build_projection(df)
+
     if proj and proj.get("valido"):
         budgets = load_budgets()
+
         if not budgets.empty:
             total_orcado = float(budgets["valor_orcado"].sum())
+
             if total_orcado > 0 and float(proj["projecao"]) > total_orcado:
-                excesso_proj = float(proj["projecao"]) - total_orcado
+                excesso = float(proj["projecao"]) - total_orcado
+
                 insights.append((
                     "error",
-                    f"Mantendo o ritmo atual, a projeção do mês supera o orçamento total em {format_brl(excesso_proj)}."
+                    f"Se continuar assim, você vai estourar o orçamento do mês em {format_brl(excesso)}."
                 ))
 
     return insights[:8]
-
-
-def page_insights(df: pd.DataFrame, start_date, end_date) -> None:
-    st.subheader("Insights")
-    st.caption("Leitura automática dos principais sinais do período selecionado.")
-
-    insights = build_insights(df, start_date, end_date)
-    if not insights:
-        st.info("Ainda não há dados suficientes para gerar insights relevantes neste período.")
-        return
-
-    for level, message in insights:
-        if level == "error":
-            st.error(message)
-        elif level == "warning":
-            st.warning(message)
-        else:
-            st.info(message)
-
-
-def page_projection(df: pd.DataFrame) -> None:
-    st.subheader("Projeção do mês atual")
-
-    hoje = pd.Timestamp.today().normalize()
-    inicio_mes = hoje.replace(day=1)
-    st.caption(
-        f"Esta projeção considera apenas o mês atual, independentemente do filtro lateral. Período usado: {inicio_mes.strftime('%d/%m/%Y')} até {hoje.strftime('%d/%m/%Y')}."
-    )
-
-    proj = build_projection(df)
-
-    if not proj or not proj.get("valido"):
-        st.info("Dados insuficientes para projeção (mínimo 5 dias de dados no mês).")
-        return
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Gasto atual", format_brl(proj["gasto_atual"]))
-    c2.metric("Projeção do mês", format_brl(proj["projecao"]))
-    c3.metric("Dias considerados", f"{proj['dias_decorridos']} / {proj['dias_mes']}")
-
-    diff = proj["projecao"] - proj["gasto_atual"]
-    if diff > 0:
-        st.warning(f"Mantendo o ritmo atual, você deve gastar mais {format_brl(diff)} até o fim do mês.")
-    else:
-        st.success("Ritmo de gasto controlado.")
-
-    st.markdown("---")
-
-    st.write("**Projeção por categoria**")
-    cat_df = build_projection_by_category(df)
-
-    if cat_df.empty:
-        st.info("Sem dados suficientes por categoria.")
-        return
-
-    cat_df["gasto_atual"] = cat_df["gasto_atual"].map(format_brl)
-    cat_df["projecao"] = cat_df["projecao"].map(format_brl)
-
-    st.dataframe(cat_df[["categoria", "gasto_atual", "projecao"]], use_container_width=True, hide_index=True)
-
-
-def main() -> None:
-    st.set_page_config(page_title="Controle Financeiro Pessoal", layout="wide")
-    init_db()
-
-    st.title("Controle Financeiro Pessoal")
-    st.caption("MVP com importação OFX, persistência em SQLite e lançamentos manuais.")
-
-    menu = st.sidebar.radio(
-        "Navegação",
-        [
-            "Dashboard",
-            "Importar OFX",
-            "Lançamento manual",
-            "Revisão",
-            "Transações",
-            "Orçamento",
-            "Padrões",
-            "Projeção",
-            "Insights",
-            "Histórico de importações",
-        ],
-    )
-
-    df = load_transactions()
-
-    st.sidebar.markdown("---")
-    st.sidebar.write("**Filtro de período**")
-
-    if df.empty:
-        start_date = datetime.today().date()
-        end_date = datetime.today().date()
-    else:
-        min_date = df["data"].min().date()
-        max_date = df["data"].max().date()
-        start_date = st.sidebar.date_input("Data inicial", value=min_date, min_value=min_date, max_value=max_date)
-        end_date = st.sidebar.date_input("Data final", value=max_date, min_value=min_date, max_value=max_date)
-
-        if start_date > end_date:
-            st.sidebar.error("A data inicial não pode ser maior que a data final.")
-            return
-
-    if menu == "Dashboard":
-        page_dashboard(df, start_date, end_date)
-    elif menu == "Importar OFX":
-        page_import_ofx()
-    elif menu == "Lançamento manual":
-        page_manual_entry()
-    elif menu == "Revisão":
-        page_review()
-    elif menu == "Transações":
-        page_transactions(df, start_date, end_date)
-    elif menu == "Orçamento":
-        page_budget(df, start_date, end_date)
-    elif menu == "Padrões":
-        page_patterns(df, start_date, end_date)
-    elif menu == "Projeção":
-        page_projection(df)
-    elif menu == "Insights":
-        page_insights(df, start_date, end_date)
-    elif menu == "Histórico de importações":
-        page_import_history()
-
-
-if __name__ == "__main__":
-    main()
